@@ -1,14 +1,15 @@
 import streamlit as st
-import urllib.parse
-import hashlib
+import ollama
 import json
 import os
-import random
+import hashlib
 import pandas as pd
-import requests
-import ollama
+from sklearn.tree import DecisionTreeClassifier
+import base64
+import random
+import urllib.parse
 
-# 🔄 Loader Animation
+# ⬇️ Loader animation
 def show_loader(placeholder):
     placeholder.markdown("""
     <style>
@@ -16,139 +17,180 @@ def show_loader(placeholder):
             display: flex;
             justify-content: center;
             align-items: center;
-            height: 200px;
+            height: 300px;
         }
         .ring {
-            border: 8px solid #f3f3f3;
-            border-top: 8px solid #4CAF50;
+            border: 10px solid;
+            border-top: 10px solid #4CAF50;
             border-radius: 50%;
-            width: 60px;
-            height: 60px;
-            animation: spin 1s linear infinite;
+            position: absolute;
+            animation: spin 2s linear infinite;
+        }
+        .ring1 {
+            width: 120px;
+            height: 120px;
+        }
+        .ring2 {
+            width: 80px;
+            height: 80px;
+            border-top: 10px solid #2196F3;
+            animation-duration: 1.5s;
         }
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
     </style>
-    <div class="loader-wrapper"><div class="ring"></div></div>
+    <div class="loader-wrapper">
+        <div class="ring ring1"></div>
+        <div class="ring ring2"></div>
+    </div>
     """, unsafe_allow_html=True)
 
-# 🔗 Generate search URL for a site
+# 🔍 Query LLaMA 3 to extract parts info
+def parse_query_llama3(query):
+    prompt = f"""
+    Extract the automobile part type, automobile part model, vehicle model, and price range from the following query:
+
+    Query: "{query}"
+
+    Respond in JSON format with keys: part_type, vehicle_model, price_range (as a list of two numbers).
+    """
+    try:
+        response = ollama.chat(
+            model='llama3',
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        content = response['message']['content']
+        json_start = content.find('{')
+        json_end = content.rfind('}')
+        if json_start != -1 and json_end != -1:
+            json_str = content[json_start:json_end+1]
+            return json.loads(json_str)
+        else:
+            raise ValueError("No valid JSON found in response.")
+    except Exception as e:
+        print("LLaMA 3 Parsing Error:", e)
+        return {"part_type": "", "vehicle_model": "", "price_range": [0, 999999]}
+
+# 🔌 Build search URL for each site
 def get_search_url(site, query):
     encoded_query = urllib.parse.quote_plus(query)
-    urls = {
-        "amazon": f"https://www.amazon.in/s?k={encoded_query}",
+    site = site.lower()
+    domain_map = {
         "flipkart": f"https://www.flipkart.com/search?q={encoded_query}",
-        "ebay": f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}",
+        "amazon": f"https://www.amazon.in/s?k={encoded_query}",
         "snapdeal": f"https://www.snapdeal.com/search?keyword={encoded_query}",
+        "ebay": f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}",
         "indiamart": f"https://dir.indiamart.com/search.mp?ss={encoded_query}",
         "boodmo": f"https://boodmo.com/catalog/search/?q={encoded_query}",
         "pricerunner": f"https://www.pricerunner.com/search?q={encoded_query}",
-        "gomechanic": f"https://gomechanic.in/spares/search?query={encoded_query}",
-        "cardekho": f"https://www.cardekho.com/search/result?q={encoded_query}",
+        "gomechanic": f"https://gomechanic.in/spares?q={encoded_query}",
+        "cardekho": f"https://www.cardekho.com/cars?q={encoded_query}",
         "autodoc": f"https://www.autodoc.co.uk/search?keyword={encoded_query}",
-        "motointegrator": f"https://www.motointegrator.com/search?query={encoded_query}",
-        "partslink24": f"https://www.partslink24.com/partslink24-web/pages/home.jsf?search={encoded_query}",
-        "tecalliance": f"https://www.tecalliance.net/en/search?q={encoded_query}",
-        "camelcamelcamel": f"https://in.camelcamelcamel.com/search?sq={encoded_query}"
+        "motointegrator": f"https://www.motointegrator.com/search?keyword={encoded_query}",
+        "partslink24": f"https://www.partslink24.com/search?q={encoded_query}",
+        "tecalliance": f"https://www.tecalliance.com/en/solutions/tecdoc-catalog?q={encoded_query}",
+        "camelcamelcamel": f"https://camelcamelcamel.com/search?sq={encoded_query}"
     }
-    return urls.get(site, "")
+    return domain_map.get(site, f"{site.rstrip('/')}/search?q={encoded_query}")
 
-# 🧠 Query refinement with Ollama
-def refine_query_with_ollama(user_query):
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": f"Refine this auto part search query to be more specific for product search: {user_query}",
-                "stream": False
-            }
-        )
-        return response.json().get("response", "").strip() or user_query
-    except Exception as e:
-        st.warning(f"Ollama model not available. Using original query.\nError: {e}")
-        return user_query
-
-# 🕸️ Simulated scraping with caching
-def scrape_live_results(site, query):
+# 📦 Simulated scraper with caching
+def scrape_site(query, site):
+    filename = f"cache/{hashlib.md5((query + site).encode()).hexdigest()}.json"
     os.makedirs("cache", exist_ok=True)
-    cache_file = f"cache/{hashlib.md5((query + site).encode()).hexdigest()}.json"
-    if os.path.exists(cache_file):
-        with open(cache_file, "r") as f:
+    if os.path.exists(filename):
+        with open(filename, "r") as f:
             return json.load(f)
 
-    results = []
-    for i in range(1, 6):
-        results.append({
-            "name": f"{query} - Result {i} from {site}",
-            "price": random.randint(1000, 5000),
-            "rating": round(random.uniform(3.0, 5.0), 2),
-            "link": get_search_url(site, query)
-        })
+    result = [{
+        "name": f"{query} - Sample from {site}",
+        "price": random.randint(1200, 2000),
+        "rating": round(random.uniform(3.8, 4.5), 2),
+        "link": get_search_url(site, query)
+    }]
+    with open(filename, "w") as f:
+        json.dump(result, f)
+    return result
 
-    with open(cache_file, "w") as f:
-        json.dump(results, f)
-    return results
-
-# ✅ Optimal product selection
+# 🏆 Choose best product
 def choose_optimal(results):
     df = pd.DataFrame(results)
     if df.empty:
         return pd.DataFrame()
+
     df["norm_price"] = (df["price"] - df["price"].min()) / (df["price"].max() - df["price"].min() + 1e-6)
     df["norm_rating"] = (df["rating"] - df["rating"].min()) / (df["rating"].max() - df["rating"].min() + 1e-6)
     df["score"] = (1 - df["norm_price"]) * 0.6 + df["norm_rating"] * 0.4
     return df.sort_values(by="score", ascending=False).head(1)
 
-# 🌐 Supported e-commerce platforms
+# 🌐 Supported sites
 supported_sites = [
     "amazon", "ebay", "flipkart", "snapdeal", "indiamart", "boodmo", "pricerunner",
     "gomechanic", "cardekho", "autodoc", "motointegrator", "partslink24", "tecalliance", "camelcamelcamel"
 ]
 
-# 🌟 UI Setup
-st.set_page_config(page_title="Auto Part Finder", layout="wide")
+# 🖼️ Streamlit App UI
 st.title("🔧 Auto Part Finder Chatbot")
 
-# 🔁 Refresh search results
-if st.button("🔄 Refresh Search"):
-    st.session_state.pop("search_results", None)
-    st.session_state.pop("optimal_result", None)
-    st.rerun()
+# Session state to manage input/results
+if "show_results" not in st.session_state:
+    st.session_state["show_results"] = False
+if "query" not in st.session_state:
+    st.session_state["query"] = ""
+if "results" not in st.session_state:
+    st.session_state["results"] = []
+if "optimal" not in st.session_state:
+    st.session_state["optimal"] = pd.DataFrame()
 
-# 🔎 Search input
-query = st.text_input("Search for an auto part (e.g., 'brake pad for Honda City')")
+col1, col2 = st.columns([4, 1])
+with col1:
+    user_query = st.text_input("Enter your automobile part request:", value=st.session_state["query_input"] if "query_input" in st.session_state else "", key="query_input")
+with col2:
+    if st.button("🧹 Clear"):
+        st.session_state["query"] = ""
+        st.session_state["results"] = []
+        st.session_state["optimal"] = pd.DataFrame()
+        st.session_state["show_results"] = False
+        st.rerun()  # ✅ Updated here
 
-# 🔍 Perform search
-if query and "search_results" not in st.session_state:
-    loader = st.empty()
-    show_loader(loader)
+if user_query and not st.session_state["show_results"]:
+    loader_placeholder = st.empty()
+    show_loader(loader_placeholder)
 
-    refined_query = refine_query_with_ollama(query)
+    parsed = parse_query_llama3(user_query)
+    search_query = f"{parsed['part_type']} for {parsed['vehicle_model']}"
     all_results = []
 
     for site in supported_sites:
-        results = scrape_live_results(site, refined_query)
-        all_results.extend(results)
+        all_results.extend(scrape_site(search_query, site))
 
-    df_results = pd.DataFrame(all_results)
-    st.session_state["search_results"] = df_results
-    st.session_state["optimal_result"] = choose_optimal(all_results)
-    loader.empty()
-    st.rerun()
+    optimal_df = choose_optimal(all_results)
 
-# 📊 Display results
-if "search_results" in st.session_state:
-    st.subheader("📊 All Search Results")
-    st.dataframe(st.session_state["search_results"])
+    st.session_state["query"] = search_query
+    st.session_state["results"] = all_results
+    st.session_state["optimal"] = optimal_df
+    st.session_state["show_results"] = True
+    loader_placeholder.empty()
+    st.rerun()  # ✅ Updated here
 
-    csv = st.session_state["search_results"].to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download CSV", csv, "auto_parts_results.csv", "text/csv")
+# Show results if available
+if st.session_state["show_results"]:
+    st.write("🔍 **Search Query:**", st.session_state["query"])
+    results_df = pd.DataFrame(st.session_state["results"])
+    st.write("📦 **All Search Results:**")
+    st.dataframe(results_df)
 
-    st.subheader("✅ Suggested Optimal Product")
-    if not st.session_state["optimal_result"].empty:
-        st.dataframe(st.session_state["optimal_result"][["name", "price", "rating", "link"]])
+    csv_data = results_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download Results as CSV",
+        data=csv_data,
+        file_name="auto_parts_results.csv",
+        mime="text/csv"
+    )
+
+    st.write("✅ **Optimal Recommendation:**")
+    if not st.session_state["optimal"].empty:
+        st.dataframe(st.session_state["optimal"][["name", "price", "rating", "link"]])
     else:
-        st.warning("No optimal product found.")
+        st.warning("No suitable products found.")
